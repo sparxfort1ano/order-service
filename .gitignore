@@ -1,0 +1,23 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+build/
+*.log
+*.tmp
+*.swp
+
+# VS Code
+.vscode/
+.idea/
+*.iml
+
+# Docker
+*.pid
+*.seed
+pgdata/

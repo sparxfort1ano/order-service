@@ -1,0 +1,52 @@
+services:
+  # База данных Postgres
+  postgres:
+    image: postgres:16
+    container_name: ordersvc-postgres
+    environment:
+      POSTGRES_USER: app      # логин б/д
+      POSTGRES_PASSWORD: app  # пароль б/д
+      POSTGRES_DB: orders     # имя б/д
+    ports: ["5432:5432"]      # проброс порта на хост
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # том для сохранения данных б/д
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U app -d orders"] # проверка готовности б/д
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Брокер Redpanda (совместим с Kafka)
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.10
+    container_name: ordersvc-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=true
+
+      # два слушателя: внутренний (для контейнеров) и внешний (для хоста)
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092,EXTERNAL://localhost:9093
+    ports: ["9093:9093"]        # проброс порта Kafka на хост
+    depends_on:
+      postgres:
+        condition: service_healthy   # ждать готовности Postgres
+
+  # Веб-консоль для просмотра топиков/сообщений
+  console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: ordersvc-console
+    environment:
+      KAFKA_BROKERS: redpanda:9092  # адрес брокера из сети docker-compose
+    ports: ["8080:8080"]            # UI доступен на http://localhost:8080
+    depends_on: [redpanda]          # запускать после брокера
+
+# Том 
+volumes:
+  pgdata:  

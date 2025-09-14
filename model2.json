@@ -1,0 +1,49 @@
+{
+    "order_uid": "a12345newtestuid",
+    "track_number": "WBTESTTRACK123",
+    "entry": "WBIL",
+    "delivery": {
+        "name": "Ivan Ivanov",
+        "phone": "+79001234567",
+        "zip": "101000",
+        "city": "Moscow",
+        "address": "Lenina 1",
+        "region": "Moscow",
+        "email": "ivanov@example.com"
+    },
+    "payment": {
+        "transaction": "a12345newtestuid",
+        "request_id": "",
+        "currency": "RUB",
+        "provider": "wbpay",
+        "amount": 2500,
+        "payment_dt": 1637908888,
+        "bank": "sber",
+        "delivery_cost": 300,
+        "goods_total": 2200,
+        "custom_fee": 0
+    },
+    "items": [
+        {
+            "chrt_id": 1111111,
+            "track_number": "WBTESTTRACK123",
+            "price": 2200,
+            "rid": "rid111111",
+            "name": "Sneakers",
+            "sale": 0,
+            "size": "42",
+            "total_price": 2200,
+            "nm_id": 3333333,
+            "brand": "Nike",
+            "status": 202
+        }
+    ],
+    "locale": "ru",
+    "internal_signature": "",
+    "customer_id": "cust123",
+    "delivery_service": "pochta",
+    "shardkey": "1",
+    "sm_id": 101,
+    "date_created": "2025-09-13T00:00:00Z",
+    "oof_shard": "1"
+}

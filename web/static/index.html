@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>WB order lookup</title>
+  </head>
+
+  <body style="font-family: sans-serif; max-width: 720px; margin: 24px auto">
+    <!-- Заголовок страницы -->
+    <h2>Find order</h2>
+
+    <!-- Поле для ввода order_uid -->
+    <input
+      id="id"
+      style="width: 60%"
+      placeholder="order_uid"
+    />
+
+    <!-- Кнопка для запроса данных -->
+    <button id="go">Получить заказ</button>
+
+    <!-- Вывод полученных данных из сервера -->
+    <pre
+      id="out"
+      style="
+        background: #f6f8fa;
+        padding: 12px;
+        border-radius: 8px;
+        white-space: pre-wrap;
+      "
+    >
+...</pre>
+
+    <!-- Отправляем запрос на сервер в виде идентификатора по клику кнопки и выводим результат -->
+    <script>
+      document.getElementById("go").onclick = async () => {
+        const id = document.getElementById("id").value.trim();
+        const r = await fetch("/order/" + encodeURIComponent(id));
+        document.getElementById("out").textContent = r.ok
+          ? JSON.stringify(await r.json(), null, 2)
+          : await r.text();
+      };
+    </script>
+  </body>
+</html>
