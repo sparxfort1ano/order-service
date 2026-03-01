@@ -4,68 +4,75 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/segmentio/kafka-go"
-
+	"github.com/sparxfort1ano/order-service/internal/cache"
 	"github.com/sparxfort1ano/order-service/internal/repository"
-	"github.com/sparxfort1ano/order-service/internal/service"
 )
 
-// Потребитель слушает Kafka и отправляет заказы в сервис
-type Consumer struct {
+type OrderConsumer struct {
 	reader *kafka.Reader
-	svc    *service.Service
+	repo   *repository.PostgresRepository
+	cache  *cache.Cache
 }
 
-// Создание нового потребителя
-func New(brokers []string, topic, group string, svc *service.Service) *Consumer {
-	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     brokers,           // адреса брокеров
-		Topic:       topic,             // топик для чтения
-		GroupID:     group,             // группа потребителя
-		MinBytes:    1e3,               // минимум байт в сообщении
-		MaxBytes:    10e6,              // максимум байт
-		MaxWait:     time.Second,       // ждать не дольше этой паузы
-		StartOffset: kafka.FirstOffset, // читаем все сообщения с начала
-	})
-	return &Consumer{reader: r, svc: svc}
-}
+func (c *OrderConsumer) Start(ctx context.Context) {
+	log.Println("Kafka Consumer started...")
+	defer c.reader.Close()
 
-// Запуск фоновой горутины для чтения сообщений из Kafka
-func (c *Consumer) Start(ctx context.Context) {
-	go func() {
-		defer c.reader.Close()
-		for {
-			// читаем сообщение из топика
-			m, err := c.reader.ReadMessage(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return // завершение по контексту
-				}
-				log.Printf("kafka read: %v", err)
-				continue
+	for {
+		// Kafka reading
+		msg, err := c.reader.FetchMessage(ctx)
+		if err != nil {
+			if err == context.Canceled {
+				log.Println("Kafka reader stopped by context")
+				return
 			}
-
-			// Парсим JSON в структуру заказа
-			var ord repository.Order
-			if err := json.Unmarshal(m.Value, &ord); err != nil {
-				log.Printf("kafka bad json (skip): %v", err)
-				continue
-			}
-
-			// игнорируем сообщения без order_uid
-			if ord.OrderUID == "" {
-				log.Printf("kafka message without order_uid (skip)")
-				continue
-			}
-
-			// сохраняем заказ через сервис
-			if err := c.svc.Save(ctx, ord); err != nil {
-				log.Printf("save failed: %v", err)
-				continue
-			}
-			log.Printf("kafka saved order %s", ord.OrderUID)
+			log.Printf("failed to read from Kafka: %v", err)
+			return
 		}
-	}()
+
+		// Unmarshaling
+		var order repository.Order
+		if err := json.Unmarshal(msg.Value, &order); err != nil {
+			log.Printf("failed to unmarshal order: %v, Data: %s", err, string(msg.Value))
+			continue
+		}
+
+		// Validation
+		if err := order.Validate(); err != nil {
+			log.Printf("invalid order data for UID %s: %v", order.OrderUid, err)
+			continue
+		}
+
+		// Inserting into DB
+		if err := c.repo.SaveOrder(ctx, &order); err != nil {
+			log.Printf("failed to save order %s to DB: %v", order.OrderUid, err)
+			continue
+		}
+
+		// Do an offset
+		c.reader.CommitMessages(ctx, msg)
+
+		// Cache update
+		c.cache.Set(&order)
+
+		log.Printf("Successfully processed order: %s", order.OrderUid)
+	}
+}
+
+// Init consumer
+func NewOrderConsumer(broker, topic string,
+	repo *repository.PostgresRepository, cache *cache.Cache) *OrderConsumer {
+	return &OrderConsumer{
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:  []string{broker},
+			Topic:    topic,
+			GroupID:  "order-group",
+			MinBytes: 1000,
+			MaxBytes: 1000000,
+		}),
+		repo:  repo,
+		cache: cache,
+	}
 }

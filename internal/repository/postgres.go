@@ -2,73 +2,161 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/lib/pq"
 )
 
-// Репозиторий для работы с Postgres
-type PostgresRepo struct{ pool *pgxpool.Pool }
+var ErrOrderNotFound = errors.New("order not found")
 
-// Конструктор репозитория
-func NewPostgresRepo(p *pgxpool.Pool) *PostgresRepo { return &PostgresRepo{pool: p} }
-
-// Создание таблицы orders и индекса, если они еще не существуют
-func (r *PostgresRepo) Init(ctx context.Context) error {
-	_, err := r.pool.Exec(ctx, `
-CREATE TABLE IF NOT EXISTS orders(
-  order_uid  TEXT PRIMARY KEY,        -- уникальный id заказа
-  payload    JSONB NOT NULL,          -- сам заказ в формате JSON
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now() -- дата вставки
-);
-CREATE INDEX IF NOT EXISTS idx_orders_payload_gin ON orders USING GIN (payload);
-`)
-	return err
+type PostgresRepository struct {
+	Db *sql.DB
 }
 
-// Добавление или обновление заказа в б/д
-func (r *PostgresRepo) Upsert(ctx context.Context, o Order) error {
-	b, err := json.Marshal(o)
+func (r *PostgresRepository) SaveOrder(ctx context.Context, o *Order) error {
+	jsonData, err := json.Marshal(o)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal data: %w", err)
 	}
-	_, err = r.pool.Exec(ctx, `
-INSERT INTO orders(order_uid, payload)
-VALUES ($1, $2)
-ON CONFLICT(order_uid) DO UPDATE SET payload = EXCLUDED.payload
-`, o.OrderUID, b)
-	return err
+
+	query := `
+        INSERT INTO orders (
+            order_uid, track_number, entry, data, 
+            locale, internal_signature, customer_id, delivery_service, 
+            shardkey, sm_id, date_created, oof_shard
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (order_uid) DO NOTHING;
+    `
+
+	if _, err = r.Db.ExecContext(
+		ctx,
+		query,
+		o.OrderUid,
+		o.TrackNumber,
+		o.Entry,
+		jsonData, // JSONB
+		o.Locale,
+		o.InternalSignature,
+		o.CustomerID,
+		o.DeliveryService,
+		o.Shardkey,
+		o.SmID,
+		o.DateCreated,
+		o.OofShard,
+	); err != nil {
+		return fmt.Errorf("failed to insert into database: %w", err)
+	}
+
+	return nil
 }
 
-// Получение одного заказа по его id
-func (r *PostgresRepo) Get(ctx context.Context, id string) (Order, error) {
-	var b []byte
-	if err := r.pool.QueryRow(ctx, `SELECT payload FROM orders WHERE order_uid=$1`, id).Scan(&b); err != nil {
-		return Order{}, err
+func (r *PostgresRepository) GetOrderById(ctx context.Context, orderUID string) (*Order, error) {
+	query := `
+	SELECT data FROM orders WHERE order_uid = $1`
+
+	row := r.Db.QueryRowContext(ctx, query, orderUID)
+
+	var jsonData []byte
+	if err := row.Scan(&jsonData); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrOrderNotFound
+		}
+		return nil, fmt.Errorf("failed to scan data: %w", err)
 	}
+
 	var o Order
-	return o, json.Unmarshal(b, &o)
+	if err := json.Unmarshal(jsonData, &o); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data: %w", err)
+	}
+
+	return &o, nil
 }
 
-// Получение списка последних n заказов
-func (r *PostgresRepo) All(ctx context.Context, n int) ([]Order, error) {
-	rows, err := r.pool.Query(ctx, `SELECT payload FROM orders ORDER BY created_at DESC LIMIT $1`, n)
+// Select all orders from database
+func (r *PostgresRepository) GetAllOrders(ctx context.Context) ([]*Order, error) {
+	queryOrders := `SELECT * FROM orders`
+	rows, err := r.Db.QueryContext(ctx, queryOrders)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to select from database: %w", err)
 	}
 	defer rows.Close()
 
-	var out []Order
+	var orders []*Order
+
 	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
 		var o Order
-		if err := json.Unmarshal(b, &o); err != nil {
+		var jsonData []byte
+
+		if err := rows.Scan(&o.OrderUid,
+			&o.TrackNumber,
+			&o.Entry,
+			&jsonData,
+			&o.Locale,
+			&o.InternalSignature,
+			&o.CustomerID,
+			&o.DeliveryService,
+			&o.Shardkey,
+			&o.SmID,
+			&o.DateCreated,
+			&o.OofShard,
+		); err != nil {
+			return nil, fmt.Errorf("failed to read the rows: %w", err)
+		}
+
+		if err := json.Unmarshal(jsonData, &o); err != nil {
 			return nil, err
 		}
-		out = append(out, o)
+
+		orders = append(orders, &o)
 	}
-	return out, rows.Err()
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read the rows: %w", err)
+	}
+
+	return orders, nil
+}
+
+// Migration mechanism
+func (r *PostgresRepository) Migrate(path string) error {
+	query, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	if _, err := r.Db.Exec(string(query)); err != nil {
+		return fmt.Errorf("failed to insert into database: %w", err)
+	}
+
+	return nil
+}
+
+// Close connection with database
+func (r *PostgresRepository) Close() error {
+	err := r.Db.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close database: %w", err)
+	}
+	return nil
+}
+
+// Postgres repository init
+func NewPostgresRepository(connStr string) (*PostgresRepository, error) {
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Database communication check
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return &PostgresRepository{
+		Db: db,
+	}, nil
 }

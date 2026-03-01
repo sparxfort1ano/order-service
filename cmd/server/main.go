@@ -9,72 +9,82 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/sparxfort1ano/order-service/internal/cache"
 	"github.com/sparxfort1ano/order-service/internal/config"
 	"github.com/sparxfort1ano/order-service/internal/handler"
 	"github.com/sparxfort1ano/order-service/internal/kafka"
 	"github.com/sparxfort1ano/order-service/internal/repository"
-	"github.com/sparxfort1ano/order-service/internal/service"
 )
 
 func main() {
-	// Загружаем конфигурацию 
-	cfg := config.Load()
-	log.Printf("cfg: http=%s db=%s kafka=%s topic=%s group=%s",
-		cfg.HTTPAddr, cfg.DBDSN, cfg.KafkaBroker, cfg.KafkaTopic, cfg.KafkaGroupID)
-
-	// Контекст с отменой при завершении программы (Ctrl+C, SIGTERM)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Подключение к Postgres
-	pool, err := pgxpool.New(ctx, cfg.DBDSN)
+	// Config Loading
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatal("pg:", err)
+		log.Fatal(err)
 	}
-	defer pool.Close()
+	log.Println(cfg.AppPort)
 
-	// Репозиторий для работы с б/д
-	repo := repository.NewPostgresRepo(pool)
-	if err := repo.Init(ctx); err != nil {
-		log.Fatal("pg init:", err)
+	// DB init
+	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer repo.Close()
+
+	repo.Migrate("./migrations/000001_init.up.sql")
+	log.Println("Database initialized and migrated successfully!")
+
+	// Cache pre-warming
+	orderCache := cache.NewOrderCache()
+	orders, err := repo.GetAllOrders(ctx)
+	if err != nil {
+		log.Printf("warning: failed to warm up cache: %v", err)
+	} else {
+		for _, o := range orders {
+			orderCache.Set(o)
+		}
+		log.Printf("Successfully warmed up cache with %d orders", len(orders))
 	}
 
-	// Кэшерирование заказов в памяти
-	c := cache.New()
+	// Init producer
+	producer := kafka.NewOrderProducer(cfg.KafkaBroker, cfg.KafkaTopic)
+	go producer.Run(ctx)
 
-	// Сервис, объединяющий б/д и кэширование
-	svc := service.New(repo, c)
+	// Init consumer
+	consumer := kafka.NewOrderConsumer(cfg.KafkaBroker, cfg.KafkaTopic, repo, orderCache)
+	go consumer.Start(ctx)
 
-	// Прогрев кэша: загружаем последние заказы из б/д
-	if err := svc.Warm(ctx, 10000); err != nil {
-		log.Println("warm:", err)
-	}
-
-	// Регистрируем эндпоинты HTTP-сервера
+	// HTTP server config
+	h := handler.NewOrderHandler(orderCache, repo)
 	mux := http.NewServeMux()
-	handler.New(svc).Routes(mux)
+	mux.HandleFunc("/order", h.GetOrder)
+	mux.Handle("/", http.FileServer(http.Dir("./web/static")))
+	srv := &http.Server{
+		Addr:    ":" + cfg.AppPort,
+		Handler: mux,
+	}
 
-	// Запуск HTTP-сервера
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
+	// Server run
 	go func() {
-		log.Println("HTTP on", cfg.HTTPAddr)
-		log.Fatal(srv.ListenAndServe())
+		log.Printf("Server started on http://localhost:%s", cfg.AppPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
 	}()
 
-	// Запуск Kafka consumer для чтения заказов из топика
-	k := kafka.New([]string{cfg.KafkaBroker}, cfg.KafkaTopic, cfg.KafkaGroupID, svc)
-	k.Start(ctx)
-	log.Println("Kafka consumer started on", cfg.KafkaBroker, "topic", cfg.KafkaTopic)
-
-	// Ждем завершения (Ctrl+C или сигнал)
+	// Graceful shutdown
 	<-ctx.Done()
-	log.Println("shutting down...")
+	log.Println("Shutting down gracefully...")
 
-	// Плавное завершение работы HTTP-сервера
-	sh, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(sh)
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited")
 }
